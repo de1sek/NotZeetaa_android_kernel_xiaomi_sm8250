@@ -1,5 +1,4 @@
 name: Build Mi10S (thyme) Kernel
-
 on:
   workflow_dispatch:
     inputs:
@@ -9,26 +8,36 @@ on:
         default: "vendor/thyme_defconfig"
   push:
     branches: [ "main" ]
-
 env:
   # 保持与源码 .circleci 脚本一致的架构与产物路径
   ARCH: arm64
   OUT_DIR: out
   CCACHE_DIR: /home/runner/.ccache
-
 jobs:
   build:
     # ubuntu-22.04 已从 2026-09-17 开始弃用，2027-04-17 后完全下线；
     # 这里固定使用 ubuntu-24.04，并已验证 libtinfo5 修复方法在其上同样有效。
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-
     steps:
       - name: 检出内核源码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-
+          # 修复点①：原来的 fetch-depth: 0 会让 actions/checkout 拉取
+          # "所有分支 + 所有 tag" 的完整历史。这个内核仓库有 CAF、CAF_MSM、
+          # PELT、WALT、beta、beta2、dfod、lineage-18.1、mglru-slmk、
+          # mglru-staging、rebase、rebase2、staging、uclamp、udfps、
+          # ups-udfps 等 16 个以上分支，实测仅这一步就耗时约 4 分钟，
+          # 占了整个 job 运行时间的绝大部分，且这些历史数据对编译内核
+          # 毫无用处——make 只需要当前 commit 的源码树。
+          # 改为浅克隆(fetch-depth: 1)，只拉取当前分支最新一次提交，
+          # 检出速度可从几分钟降到几秒/十几秒。
+          # 副作用说明：如果 scripts/setlocalversion 依赖 git describe
+          # 来生成内核版本号里的 commit 后缀，浅克隆下可能拿不到匹配的
+          # tag，这只会让版本字符串少一段信息，不会导致编译失败。如果
+          # 你确实需要完整的 git describe 信息，可以把下面改成
+          # fetch-depth: 0，但建议只在必要时才这样做。
+          fetch-depth: 1
       - name: 安装编译依赖 (标准 Linux 内核 + Android CAF 内核所需)
         run: |
           sudo apt-get update
@@ -38,7 +47,6 @@ jobs:
             build-essential git curl wget \
             rsync cpio \
             ccache
-
       # -------------------------------------------------------------------
       # 关键修复：proton-clang 的预编译 clang 依赖 libtinfo.so.5，
       # 而 ubuntu-24.04 / 22.04 镜像默认只带 libtinfo6，必须手动补装，
@@ -46,22 +54,33 @@ jobs:
       # -------------------------------------------------------------------
       - name: 修复 libtinfo5 (proton-clang 预编译 clang 运行依赖)
         run: |
-          wget -q http://security.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.3-2ubuntu0.1_amd64.deb
-          sudo apt-get install -y ./libtinfo5_6.3-2ubuntu0.1_amd64.deb
-          rm -f libtinfo5_6.3-2ubuntu0.1_amd64.deb
-
+          # 修复点②：不要再硬编码具体的 .deb 文件名/版本号直链下载。
+          # 原脚本写死了 libtinfo5_6.3-2ubuntu0.1_amd64.deb，但 Ubuntu
+          # 官方在 2026-07-02 发布了 ncurses 安全更新，jammy-security 源
+          # 上的 libtinfo5 已升级为 6.3-2ubuntu0.2，旧版本 0.1 的 .deb
+          # 文件随即从 security.ubuntu.com 的 pool 目录里被删除，
+          # 于是 wget 直链返回 404，进程以 exit code 8 结束
+          # (wget: 服务器返回了错误响应)。
+          # 这里改为临时挂载 jammy-security 源，让 apt 自己解析"当前"
+          # 可用的 libtinfo5 版本再安装，装完立刻移除这个源，不影响
+          # 后续针对 noble(24.04) 的 apt 操作。这样即使以后 Ubuntu 再发
+          # 安全更新、版本号再变化，这一步也不会失效。
+          echo "deb http://security.ubuntu.com/ubuntu jammy-security universe" \
+            | sudo tee /etc/apt/sources.list.d/jammy-security-libtinfo5.list
+          sudo apt-get update
+          sudo apt-get install -y libtinfo5
+          sudo rm -f /etc/apt/sources.list.d/jammy-security-libtinfo5.list
+          sudo apt-get update
       - name: 克隆 Proton Clang 工具链 (源码 .circleci/build.sh 中指定的工具链)
         run: |
           git clone --depth=1 https://github.com/kdrag0n/proton-clang.git "${HOME}/proton-clang"
           echo "${HOME}/proton-clang/bin" >> "$GITHUB_PATH"
-
       - name: 校验工具链可用性
         run: |
           export PATH="${HOME}/proton-clang/bin:$PATH"
           clang --version
           aarch64-linux-gnu-ld -v
           arm-linux-gnueabi-ld -v
-
       - name: 启用 ccache 缓存 (加速重复编译，非必需但强烈建议)
         uses: actions/cache@v4
         with:
@@ -69,19 +88,16 @@ jobs:
           key: ccache-thyme-${{ github.sha }}
           restore-keys: |
             ccache-thyme-
-
       - name: 生成 defconfig
         run: |
           export PATH="${HOME}/proton-clang/bin:$PATH"
           make O=${OUT_DIR} ARCH=arm64 ${{ github.event.inputs.defconfig || 'vendor/thyme_defconfig' }}
-
       - name: 编译内核 (只产出 Image)
         run: |
           export PATH="${HOME}/proton-clang/bin:$PATH"
           export USE_CCACHE=1
           export KBUILD_BUILD_USER="github-actions"
           export KBUILD_BUILD_HOST="ci"
-
           make -j$(nproc --all) O=${OUT_DIR} \
             ARCH=arm64 \
             CC="ccache clang" \
@@ -89,12 +105,10 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             Image \
             2>&1 | tee build.log
-
       - name: 校验 Image 是否生成
         run: |
           test -f ${OUT_DIR}/arch/arm64/boot/Image
           echo "Image 已生成"
-
       - name: 上传 Image
         if: success()
         uses: actions/upload-artifact@v4
@@ -102,7 +116,6 @@ jobs:
           name: thyme-Image-${{ github.run_number }}
           path: out/arch/arm64/boot/Image
           retention-days: 14
-
       - name: 上传编译日志 (无论成功失败都上传，便于排错)
         if: always()
         uses: actions/upload-artifact@v4
