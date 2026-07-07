@@ -1,0 +1,112 @@
+name: Build Mi10S (thyme) Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "defconfig 名称 (相对 arch/arm64/configs/)"
+        required: false
+        default: "vendor/thyme_defconfig"
+  push:
+    branches: [ "main" ]
+
+env:
+  # 保持与源码 .circleci 脚本一致的架构与产物路径
+  ARCH: arm64
+  OUT_DIR: out
+  CCACHE_DIR: /home/runner/.ccache
+
+jobs:
+  build:
+    # ubuntu-22.04 已从 2026-09-17 开始弃用，2027-04-17 后完全下线；
+    # 这里固定使用 ubuntu-24.04，并已验证 libtinfo5 修复方法在其上同样有效。
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: 检出内核源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装编译依赖 (标准 Linux 内核 + Android CAF 内核所需)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex \
+            libssl-dev libelf-dev openssl \
+            build-essential git curl wget \
+            rsync cpio \
+            ccache
+
+      # -------------------------------------------------------------------
+      # 关键修复：proton-clang 的预编译 clang 依赖 libtinfo.so.5，
+      # 而 ubuntu-24.04 / 22.04 镜像默认只带 libtinfo6，必须手动补装，
+      # 否则第一次调用 clang 就会直接报错退出，编译无法进行。
+      # -------------------------------------------------------------------
+      - name: 修复 libtinfo5 (proton-clang 预编译 clang 运行依赖)
+        run: |
+          wget -q http://security.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.3-2ubuntu0.1_amd64.deb
+          sudo apt-get install -y ./libtinfo5_6.3-2ubuntu0.1_amd64.deb
+          rm -f libtinfo5_6.3-2ubuntu0.1_amd64.deb
+
+      - name: 克隆 Proton Clang 工具链 (源码 .circleci/build.sh 中指定的工具链)
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git "${HOME}/proton-clang"
+          echo "${HOME}/proton-clang/bin" >> "$GITHUB_PATH"
+
+      - name: 校验工具链可用性
+        run: |
+          export PATH="${HOME}/proton-clang/bin:$PATH"
+          clang --version
+          aarch64-linux-gnu-ld -v
+          arm-linux-gnueabi-ld -v
+
+      - name: 启用 ccache 缓存 (加速重复编译，非必需但强烈建议)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-thyme-${{ github.sha }}
+          restore-keys: |
+            ccache-thyme-
+
+      - name: 生成 defconfig
+        run: |
+          export PATH="${HOME}/proton-clang/bin:$PATH"
+          make O=${OUT_DIR} ARCH=arm64 ${{ github.event.inputs.defconfig || 'vendor/thyme_defconfig' }}
+
+      - name: 编译内核 (只产出 Image)
+        run: |
+          export PATH="${HOME}/proton-clang/bin:$PATH"
+          export USE_CCACHE=1
+          export KBUILD_BUILD_USER="github-actions"
+          export KBUILD_BUILD_HOST="ci"
+
+          make -j$(nproc --all) O=${OUT_DIR} \
+            ARCH=arm64 \
+            CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            Image \
+            2>&1 | tee build.log
+
+      - name: 校验 Image 是否生成
+        run: |
+          test -f ${OUT_DIR}/arch/arm64/boot/Image
+          echo "Image 已生成"
+
+      - name: 上传 Image
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thyme-Image-${{ github.run_number }}
+          path: out/arch/arm64/boot/Image
+          retention-days: 14
+
+      - name: 上传编译日志 (无论成功失败都上传，便于排错)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: build.log
+          retention-days: 14
