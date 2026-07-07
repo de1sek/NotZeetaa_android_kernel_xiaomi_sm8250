@@ -71,13 +71,48 @@ jobs:
           sudo apt-get install -y libtinfo5
           sudo rm -f /etc/apt/sources.list.d/jammy-security-libtinfo5.list
           sudo apt-get update
-      - name: 克隆 Proton Clang 工具链 (源码 .circleci/build.sh 中指定的工具链)
+      # -------------------------------------------------------------------
+      # 修复点③：proton-clang 是一份完整预编译的 LLVM/Clang + binutils
+      # 工具链仓库，即使 --depth=1 只克隆最新一次提交，那次提交本身的文件
+      # 内容(clang、lld、各架构头文件与库)体积仍有 1GB+。实测 git clone
+      # 这一步"下载数据包"就要花约 90 秒，本地把 1110 个文件写盘反而只要
+      # 几秒钟——慢在网络传输，不是检出逻辑本身，--depth=1 已经是能做的
+      # 极限了。该工具链自 2021-05-22 (LLVM 13.0.0 / binutils 2.36.1) 起
+      # 就再未更新，事实上已"冻结"，因此用固定 key 缓存起来，命中缓存后
+      # 可以跳过这 90 秒的下载。
+      # -------------------------------------------------------------------
+      - name: 缓存 Proton Clang 工具链
+        id: proton-clang-cache
+        uses: actions/cache@v4
+        with:
+          # 注意：这里用固定的 /home/runner 而不是 ${{ env.HOME }}，
+          # 因为 HOME 是 runner 进程的环境变量，未必能在 GitHub Actions
+          # 表达式的 env 上下文里取到；ubuntu-24.04 hosted runner 的
+          # $HOME 固定就是 /home/runner。
+          path: /home/runner/proton-clang
+          key: proton-clang-20210522
+      - name: 克隆 Proton Clang 工具链 (仅缓存未命中时执行；源码 .circleci/build.sh 中指定的工具链)
+        if: steps.proton-clang-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth=1 https://github.com/kdrag0n/proton-clang.git "${HOME}/proton-clang"
-          echo "${HOME}/proton-clang/bin" >> "$GITHUB_PATH"
       - name: 校验工具链可用性
         run: |
-          export PATH="${HOME}/proton-clang/bin:$PATH"
+          # 修复点④：这里以及后面两步都改成把 proton-clang/bin 追加到
+          # PATH 末尾，而不是放在最前面(不再使用 $GITHUB_PATH，因为它固定
+          # 会把路径插到最前面，没法控制顺序)。
+          # 原因：proton-clang 自带的 ld 是 2021 年的 GNU Binutils 2.36.1，
+          # 不认识 Ubuntu 24.04 glibc 采用的新版 RELR 压缩重定位格式，链接
+          # 编译内核所需的 host 工具(如 fixdep，用系统自带 gcc 编译)时
+          # 会报 "unknown type [0x13] section `.relr.dyn'" 并失败——因为
+          # gcc 内部调用裸名 ld 完全依赖 PATH 查找(用 `gcc
+          # -print-prog-name=ld` 可以验证 gcc 并不内置私有的 ld)，原来的
+          # PATH 顺序让它优先找到 proton-clang 里那个旧 ld，而不是系统自带、
+          # 与系统 libc 版本匹配的 /usr/bin/ld。
+          # 追加到末尾后：clang、aarch64-linux-gnu-ld、arm-linux-gnueabi-ld
+          # 这些只有 proton-clang 提供的工具依然能正常找到(不受顺序影响)，
+          # 而编译 host 工具时用到的裸名 ld/as 会优先使用系统自带版本，
+          # 从而避免这个兼容性问题。
+          export PATH="$PATH:${HOME}/proton-clang/bin"
           clang --version
           aarch64-linux-gnu-ld -v
           arm-linux-gnueabi-ld -v
@@ -90,11 +125,11 @@ jobs:
             ccache-thyme-
       - name: 生成 defconfig
         run: |
-          export PATH="${HOME}/proton-clang/bin:$PATH"
+          export PATH="$PATH:${HOME}/proton-clang/bin"
           make O=${OUT_DIR} ARCH=arm64 ${{ github.event.inputs.defconfig || 'vendor/thyme_defconfig' }}
       - name: 编译内核 (只产出 Image)
         run: |
-          export PATH="${HOME}/proton-clang/bin:$PATH"
+          export PATH="$PATH:${HOME}/proton-clang/bin"
           export USE_CCACHE=1
           export KBUILD_BUILD_USER="github-actions"
           export KBUILD_BUILD_HOST="ci"
